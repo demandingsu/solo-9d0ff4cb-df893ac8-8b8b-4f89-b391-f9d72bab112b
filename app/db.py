@@ -17,6 +17,19 @@ from typing import Any
 from . import allocation as alloc
 from .config import DB_PATH, MAX_ITEMS_PER_SUBMISSION
 
+# SQLite（含 Python sqlite3 绑定）只能原生表示 64 位有符号整数。
+# 坐标在该范围内，但面积/交叠面积可能超出（如边长 3100000001 的合法矩形，
+# 面积 9610000006200000001 > 2^63-1）。
+# 面积类列声明为 BLOB 亲和（=不做任何类型强制）：bind_int 对 64 位以内的
+# 整数原样绑定，按 INTEGER 存储；超界整数以十进制文本绑定，按 TEXT 存储。
+# 不能用 INTEGER 亲和（绑定大整数直接 OverflowError），也不能用 TEXT 亲和
+# （它会把所有整数都强制转成文本）。读取侧 load_int 同时兼容两种存储类。
+SQLITE_INT64_MIN = -(2**63)
+SQLITE_INT64_MAX = 2**63 - 1
+
+# 当前数据库结构版本（记录在 PRAGMA user_version 中）
+SCHEMA_VERSION = 1
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -27,6 +40,7 @@ CREATE TABLE IF NOT EXISTS versions (
     item_count  INTEGER NOT NULL
 );
 
+-- BLOB 亲和：小面积按 INTEGER 存、超 64 位的大面积按精确十进制 TEXT 存
 CREATE TABLE IF NOT EXISTS cells (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     version_id   INTEGER NOT NULL REFERENCES versions(id),
@@ -36,7 +50,7 @@ CREATE TABLE IF NOT EXISTS cells (
     y1           INTEGER NOT NULL,
     x2           INTEGER NOT NULL,
     y2           INTEGER NOT NULL,
-    area         INTEGER NOT NULL,
+    area         BLOB NOT NULL,
     households   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cells_version ON cells(version_id);
@@ -52,22 +66,24 @@ CREATE TABLE IF NOT EXISTS generations (
     finished_at   TEXT
 );
 
+-- overlap_area 同样用 BLOB 亲和以精确保存超大交叠面积。
 CREATE TABLE IF NOT EXISTS result_parts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     generation_id  INTEGER NOT NULL REFERENCES generations(id),
     district_id    TEXT NOT NULL,
     old_id         TEXT NOT NULL,
-    overlap_area   INTEGER NOT NULL,
+    overlap_area   BLOB NOT NULL,
     households     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_parts_generation ON result_parts(generation_id);
 
 -- 单行表：始终指向“当前已发布结果”
+-- total_households 也允许超 64 位整数，用 BLOB 亲和精确保存。
 CREATE TABLE IF NOT EXISTS current_result (
     only_row       INTEGER PRIMARY KEY CHECK (only_row = 1),
     generation_id  INTEGER NOT NULL REFERENCES generations(id),
     published_at   TEXT NOT NULL,
-    total_households INTEGER NOT NULL
+    total_households BLOB NOT NULL
 );
 """
 
@@ -84,6 +100,161 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def bind_int(value: int) -> int | str:
+    """绑定任意精度整数到 SQLite：64 位内保持 INTEGER，超界用十进制文本。"""
+    if SQLITE_INT64_MIN <= value <= SQLITE_INT64_MAX:
+        return value
+    return str(value)
+
+
+def load_int(value: Any) -> int:
+    """读取经 bind_int 写入的值（int 或十进制文本），还原为精确 Python int。"""
+    if isinstance(value, int):
+        return value
+    return int(value)
+
+
+def _column_type(conn: sqlite3.Connection, table: str, column: str) -> str | None:
+    for row in conn.execute(f"PRAGMA table_info({table})"):
+        if row["name"] == column:
+            return (row["type"] or "").upper()
+    return None
+
+
+# BLOB（或空声明）代表“无亲和”，是精确整数列的目标存储类型
+_EXACT_INT_AFFINITIES = {"BLOB", ""}
+
+
+def _is_exact_int_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return _column_type(conn, table, column) in _EXACT_INT_AFFINITIES
+
+
+def _migrate_legacy_db(conn: sqlite3.Connection) -> None:
+    """把旧库（面积列为 INTEGER 亲和）迁移到精确存储结构（BLOB 亲和）。
+
+    - 旧库里的面积都在 64 位以内（否则当时根本写不进去），CAST 成 TEXT
+      得到的是精确十进制字符串，历史小面积版本与已发布结果原样保留
+      （读取侧 load_int 同时接受 INTEGER 与 TEXT 存储类）。
+    - 迁移在单事务内完成（autocommit 模式下显式 BEGIN/COMMIT，逐条执行
+      DDL/DML——SQLite 的 DDL 同样受事务保护；不能用 executescript，
+      它会在执行前隐式 COMMIT 破坏原子性）。失败整体回滚；按表逐项判断，
+      已迁移过的表自动跳过，整段幂等且可重入。
+    """
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SCHEMA_VERSION:
+        return
+
+    area_exact = _is_exact_int_column(conn, "cells", "area")
+    overlap_exact = _is_exact_int_column(conn, "result_parts", "overlap_area")
+    total_exact = _is_exact_int_column(conn, "current_result", "total_households")
+
+    # 全新数据库：表尚未创建，直接按新结构建表即可。
+    if _column_type(conn, "cells", "area") is None:
+        conn.executescript(SCHEMA)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+
+    cells_statements = [
+        """
+        CREATE TABLE cells_new (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id   INTEGER NOT NULL REFERENCES versions(id),
+            seq          INTEGER NOT NULL,
+            cell_id      TEXT NOT NULL,
+            x1           INTEGER NOT NULL,
+            y1           INTEGER NOT NULL,
+            x2           INTEGER NOT NULL,
+            y2           INTEGER NOT NULL,
+            area         BLOB NOT NULL,
+            households   INTEGER
+        )
+        """,
+        """
+        INSERT INTO cells_new
+            (id, version_id, seq, cell_id, x1, y1, x2, y2, area, households)
+        SELECT id, version_id, seq, cell_id, x1, y1, x2, y2,
+               CAST(area AS TEXT), households
+        FROM cells
+        """,
+        "DROP TABLE cells",
+        "ALTER TABLE cells_new RENAME TO cells",
+        "CREATE INDEX IF NOT EXISTS idx_cells_version ON cells(version_id)",
+    ]
+
+    parts_statements = [
+        """
+        CREATE TABLE result_parts_new (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation_id  INTEGER NOT NULL REFERENCES generations(id),
+            district_id    TEXT NOT NULL,
+            old_id         TEXT NOT NULL,
+            overlap_area   BLOB NOT NULL,
+            households     INTEGER NOT NULL
+        )
+        """,
+        """
+        INSERT INTO result_parts_new
+            (id, generation_id, district_id, old_id, overlap_area, households)
+        SELECT id, generation_id, district_id, old_id,
+               CAST(overlap_area AS TEXT), households
+        FROM result_parts
+        """,
+        "DROP TABLE result_parts",
+        "ALTER TABLE result_parts_new RENAME TO result_parts",
+        "CREATE INDEX IF NOT EXISTS idx_parts_generation "
+        "ON result_parts(generation_id)",
+    ]
+
+    current_statements = [
+        """
+        CREATE TABLE current_result_new (
+            only_row         INTEGER PRIMARY KEY CHECK (only_row = 1),
+            generation_id    INTEGER NOT NULL REFERENCES generations(id),
+            published_at     TEXT NOT NULL,
+            total_households BLOB NOT NULL
+        )
+        """,
+        """
+        INSERT INTO current_result_new
+            (only_row, generation_id, published_at, total_households)
+        SELECT only_row, generation_id, published_at,
+               CAST(total_households AS TEXT)
+        FROM current_result
+        """,
+        "DROP TABLE current_result",
+        "ALTER TABLE current_result_new RENAME TO current_result",
+    ]
+
+    # 切换到 autocommit，自行管理事务边界，保证迁移整体原子
+    original_level = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not area_exact:
+            for sql in cells_statements:
+                conn.execute(sql)
+        if not overlap_exact:
+            for sql in parts_statements:
+                conn.execute(sql)
+        if not total_exact:
+            for sql in current_statements:
+                conn.execute(sql)
+        conn.execute("COMMIT")
+    except Exception:
+        # 原异常优先向上传播；回滚本身若已无事务则忽略其错误
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.isolation_level = original_level
+
+    # 结构全部落地后再标记版本；即便此刻崩溃，下次打开也会因列已是 TEXT
+    # 而跳过全部迁移并补写版本号，行为保持幂等。
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
 def get_conn(db_path: Path | None = None) -> sqlite3.Connection:
     path = Path(db_path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,7 +263,8 @@ def get_conn(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=30000;")
-    # 保证任何连接（含后台工作线程）打开时表结构都已就绪（DDL 幂等）
+    # 旧库先做一次性结构迁移（幂等），再补建任何缺失对象（DDL 幂等）
+    _migrate_legacy_db(conn)
     conn.executescript(SCHEMA)
     return conn
 
@@ -100,7 +272,6 @@ def get_conn(db_path: Path | None = None) -> sqlite3.Connection:
 def init_db(db_path: Path | None = None) -> None:
     conn = get_conn(db_path)
     try:
-        conn.executescript(SCHEMA)
         conn.commit()
     finally:
         conn.close()
@@ -109,7 +280,7 @@ def init_db(db_path: Path | None = None) -> None:
 # ---------- 输入版本 ----------
 
 def _validate_items(kind: str, items: list[dict[str, Any]]) -> None:
-    """业务校验：数量上限、编号唯一、同版矩形互不重叠。"""
+    """业务校验：数量上限、编号唯一、同版矩形互不重叠、坐标/户数可入整数列。"""
     if not items:
         raise ValidationError("提交内容不能为空")
     if len(items) > MAX_ITEMS_PER_SUBMISSION:
@@ -120,6 +291,19 @@ def _validate_items(kind: str, items: list[dict[str, Any]]) -> None:
     if len(set(ids)) != len(ids):
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         raise ValidationError(f"条目编号必须唯一，重复编号：{', '.join(dupes)}")
+    for it in items:
+        for name, coord in zip(("x1", "y1", "x2", "y2"), it["rect"], strict=True):
+            if not (SQLITE_INT64_MIN <= coord <= SQLITE_INT64_MAX):
+                raise ValidationError(
+                    f"条目 {it['id']} 的坐标 {name}={coord} 超出 SQLite 64 位整数范围"
+                )
+        households = it.get("households")
+        if households is not None and not (
+            SQLITE_INT64_MIN <= households <= SQLITE_INT64_MAX
+        ):
+            raise ValidationError(
+                f"条目 {it['id']} 的户数 {households} 超出 SQLite 64 位整数范围"
+            )
     rects = [(it["id"], it["rect"]) for it in items]
     try:
         alloc.assert_no_internal_overlap(rects)  # 抛 ValueError
@@ -137,6 +321,7 @@ def insert_version(kind: str, items: list[dict[str, Any]], conn: sqlite3.Connect
     version_id = cur.lastrowid
     for seq, it in enumerate(items):
         x1, y1, x2, y2 = it["rect"]
+        # 面积为精确整数；超 64 位时以十进制文本精确保存（见 bind_int）
         conn.execute(
             "INSERT INTO cells(version_id, seq, cell_id, x1, y1, x2, y2, area, households)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -148,7 +333,7 @@ def insert_version(kind: str, items: list[dict[str, Any]], conn: sqlite3.Connect
                 y1,
                 x2,
                 y2,
-                alloc.rect_area(it["rect"]),
+                bind_int(alloc.rect_area(it["rect"])),
                 it.get("households"),
             ),
         )
@@ -181,7 +366,7 @@ def _load_version(conn: sqlite3.Connection, version_id: int) -> dict[str, Any]:
                 "y1": c["y1"],
                 "x2": c["x2"],
                 "y2": c["y2"],
-                "area": c["area"],
+                "area": load_int(c["area"]),
                 "households": c["households"],
             }
             for c in cells
@@ -293,7 +478,13 @@ def run_generation(gen_id: int, db_path: Path | None = None) -> None:
                 conn.execute(
                     "INSERT INTO result_parts(generation_id, district_id, old_id,"
                     " overlap_area, households) VALUES (?, ?, ?, ?, ?)",
-                    (gen_id, a.district_id, a.old_id, a.overlap_area, a.households),
+                    (
+                        gen_id,
+                        a.district_id,
+                        a.old_id,
+                        bind_int(a.overlap_area),
+                        a.households,
+                    ),
                 )
             conn.execute(
                 "UPDATE generations SET status='succeeded', error=NULL, finished_at=? WHERE id=?",
@@ -306,7 +497,7 @@ def run_generation(gen_id: int, db_path: Path | None = None) -> None:
                 "generation_id=excluded.generation_id,"
                 " published_at=excluded.published_at,"
                 " total_households=excluded.total_households",
-                (gen_id, _now(), total),
+                (gen_id, _now(), bind_int(total)),
             )
     except Exception as exc:  # 兜底：任何意外都落 failed，不卡死任务
         try:
@@ -356,7 +547,7 @@ def get_current_result(conn: sqlite3.Connection) -> dict[str, Any] | None:
             {
                 "district_id": p["district_id"],
                 "old_id": p["old_id"],
-                "overlap_area": p["overlap_area"],
+                "overlap_area": load_int(p["overlap_area"]),
                 "households": p["households"],
             }
         )
@@ -373,7 +564,7 @@ def get_current_result(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return {
         "generation_id": gen_id,
         "published_at": cur["published_at"],
-        "total_households": cur["total_households"],
+        "total_households": load_int(cur["total_households"]),
         "old_version": old_version,
         "new_version": new_version,
         "districts": districts,
